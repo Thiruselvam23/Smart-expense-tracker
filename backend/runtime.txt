@@ -1,1 +1,1 @@
-"python-3.11.0" | Out-File -FilePath backend/runtime.txt -Encoding UTF8 -NoNewline
+python-3.11.0
