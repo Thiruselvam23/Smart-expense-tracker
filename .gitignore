@@ -1,0 +1,31 @@
+﻿# Environment files - NEVER commit these
+.env
+*.env
+backend/.env
+frontend/.env
+.env.local
+.env.production
+
+# Python
+venv/
+backend/venv/
+__pycache__/
+*.pyc
+*.pyd
+
+# Node
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+
+# Uploads
+uploads/
+backend/uploads/
+
+# Zip files
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
