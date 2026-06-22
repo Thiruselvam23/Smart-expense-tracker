@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 from bson import ObjectId
 
 from app.models.user import UserRegister, UserLogin, TokenResponse, RefreshRequest, AccessTokenResponse
@@ -102,7 +102,6 @@ async def upload_profile_image(
 
 @router.get("/google")
 async def google_login():
-    """Step 1 — Redirect user to Google consent screen."""
     if not settings.GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=503, detail="Google OAuth not configured")
 
@@ -123,104 +122,105 @@ async def google_callback(
     code: str = Query(...),
     db=Depends(get_db),
 ):
-    """Step 2 — Google redirects back here with ?code=..."""
-    if not settings.GOOGLE_CLIENT_ID:
-        raise HTTPException(status_code=503, detail="Google OAuth not configured")
+    frontend_url = settings.FRONTEND_URL
 
-    logger.info(f"Google callback received. Redirect URI being used: {settings.GOOGLE_REDIRECT_URI}")
+    try:
+        logger.info(f"Google callback — using redirect_uri: {settings.GOOGLE_REDIRECT_URI}")
 
-    # Exchange code for access token
-    token_resp = requests.post(GOOGLE_TOKEN_URL, data={
-        "code":          code,
-        "client_id":     settings.GOOGLE_CLIENT_ID,
-        "client_secret": settings.GOOGLE_CLIENT_SECRET,
-        "redirect_uri":  settings.GOOGLE_REDIRECT_URI,
-        "grant_type":    "authorization_code",
-    })
+        # ── Step 1: Exchange code for token ──────────────────────────────
+        token_resp = requests.post(GOOGLE_TOKEN_URL, data={
+            "code":          code,
+            "client_id":     settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "redirect_uri":  settings.GOOGLE_REDIRECT_URI,
+            "grant_type":    "authorization_code",
+        }, timeout=10)
 
-    if not token_resp.ok:
-        error_detail = token_resp.json()
-        logger.error(f"Google token exchange failed: {error_detail}")
-        # Show exact Google error so we can debug
-        raise HTTPException(
-            status_code=400,
-            detail=f"Google auth failed: {error_detail.get('error_description', error_detail.get('error', 'Unknown'))}"
+        if not token_resp.ok:
+            err = token_resp.json()
+            logger.error(f"Token exchange failed: {err}")
+            error_msg = err.get('error_description', err.get('error', 'Token exchange failed'))
+            return RedirectResponse(f"{frontend_url}/login?error={error_msg}")
+
+        google_access_token = token_resp.json().get("access_token")
+        logger.info("Token exchange successful")
+
+        # ── Step 2: Get user info from Google ────────────────────────────
+        user_resp = requests.get(
+            GOOGLE_USER_URL,
+            headers={"Authorization": f"Bearer {google_access_token}"},
+            timeout=10,
         )
 
-    google_access_token = token_resp.json().get("access_token")
-    logger.info("Google token exchange successful")
+        if not user_resp.ok:
+            logger.error(f"User info fetch failed: {user_resp.text}")
+            return RedirectResponse(f"{frontend_url}/login?error=Failed to get user info from Google")
 
-    # Fetch user info from Google
-    user_resp = requests.get(
-        GOOGLE_USER_URL,
-        headers={"Authorization": f"Bearer {google_access_token}"},
-    )
-    if not user_resp.ok:
-        logger.error(f"Google user info fetch failed: {user_resp.text}")
-        raise HTTPException(status_code=400, detail="Failed to fetch Google user info")
+        guser      = user_resp.json()
+        email      = guser.get("email", "").strip().lower()
+        full_name  = guser.get("name") or email.split("@")[0]
+        google_pic = guser.get("picture")
+        google_id  = str(guser.get("id", ""))
 
-    guser      = user_resp.json()
-    email      = guser.get("email")
-    full_name  = guser.get("name", email.split("@")[0] if email else "User")
-    google_pic = guser.get("picture")
-    google_id  = guser.get("id")
+        logger.info(f"Google user: {email}")
 
-    logger.info(f"Google user fetched: {email}")
+        if not email:
+            return RedirectResponse(f"{frontend_url}/login?error=No email from Google")
 
-    if not email:
-        raise HTTPException(status_code=400, detail="Could not get email from Google")
+        # ── Step 3: Find or create user ──────────────────────────────────
+        existing = await db.users.find_one({"email": email})
 
-    repo = UserRepository(db)
+        if existing:
+            user_id = str(existing["_id"])
+            update  = {"updated_at": datetime.utcnow()}
+            if not existing.get("google_id"):
+                update["google_id"] = google_id
+            if not existing.get("profile_image") and google_pic:
+                update["profile_image"] = google_pic
+            await db.users.update_one({"_id": existing["_id"]}, {"$set": update})
+            logger.info(f"Existing user logged in: {user_id}")
+        else:
+            now = datetime.utcnow()
+            result = await db.users.insert_one({
+                "email":           email,
+                "full_name":       full_name,
+                "hashed_password": hash_password(uuid.uuid4().hex),
+                "google_id":       google_id,
+                "profile_image":   google_pic,
+                "is_active":       True,
+                "auth_provider":   "google",
+                "preferences":     {"currency": "INR", "default_view": "monthly"},
+                "created_at":      now,
+                "updated_at":      now,
+            })
+            user_id = str(result.inserted_id)
+            logger.info(f"New user created: {user_id}")
 
-    # Check if user already exists
-    existing = await repo.find_by_email(email)
+        # ── Step 4: Issue JWT tokens ──────────────────────────────────────
+        access_token  = create_access_token(user_id)
+        refresh_token = create_refresh_token(user_id)
 
-    if existing:
-        # Update Google info if missing
-        update = {"updated_at": datetime.utcnow()}
-        if not existing.get("google_id"):
-            update["google_id"] = google_id
-        if not existing.get("profile_image") and google_pic:
-            update["profile_image"] = google_pic
-        await db.users.update_one({"_id": existing["_id"]}, {"$set": update})
-        existing = await repo.find_by_email(email)
-        user_id  = str(existing["_id"])
-        user_doc = existing
-    else:
-        # Create new user
-        now = datetime.utcnow()
-        new_user = {
-            "email":           email,
-            "full_name":       full_name,
-            "hashed_password": hash_password(uuid.uuid4().hex),
-            "google_id":       google_id,
-            "profile_image":   google_pic,
-            "is_active":       True,
-            "auth_provider":   "google",
-            "preferences":     {"currency": "INR", "default_view": "monthly"},
-            "created_at":      now,
-            "updated_at":      now,
-        }
-        result   = await db.users.insert_one(new_user)
-        user_id  = str(result.inserted_id)
-        user_doc = new_user
-        user_doc["_id"] = result.inserted_id
+        expires_at = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
-    logger.info(f"User ready: {user_id}")
+        # Save refresh token directly (avoid repo issues)
+        await db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {
+                "refresh_token":         refresh_token,
+                "refresh_token_expires": expires_at,
+            }}
+        )
 
-    # Issue JWT tokens
-    access_token  = create_access_token(user_id)
-    refresh_token = create_refresh_token(user_id)
+        logger.info(f"Tokens issued for user: {user_id}")
 
-    expires_at = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    await repo.save_refresh_token(user_id, refresh_token, expires_at)
+        # ── Step 5: Redirect to frontend ─────────────────────────────────
+        redirect_url = (
+            f"{frontend_url}/auth/google/success"
+            f"?access_token={access_token}"
+            f"&refresh_token={refresh_token}"
+        )
+        return RedirectResponse(redirect_url)
 
-    # Redirect to frontend with tokens
-    frontend_url = settings.FRONTEND_URL
-    redirect_url = (
-        f"{frontend_url}/auth/google/success"
-        f"?access_token={access_token}"
-        f"&refresh_token={refresh_token}"
-    )
-    logger.info(f"Redirecting to frontend: {frontend_url}")
-    return RedirectResponse(redirect_url)
+    except Exception as e:
+        logger.error(f"Google callback unexpected error: {str(e)}", exc_info=True)
+        return RedirectResponse(f"{frontend_url}/login?error=Login failed. Please try again.")
