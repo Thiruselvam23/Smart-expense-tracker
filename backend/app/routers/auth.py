@@ -184,7 +184,7 @@ async def google_callback(
             result = await db.users.insert_one({
                 "email":           email,
                 "full_name":       full_name,
-                "hashed_password": hash_password(uuid.uuid4().hex),
+                "hashed_password": hash_password(uuid.uuid4().hex[:32]),
                 "google_id":       google_id,
                 "profile_image":   google_pic,
                 "is_active":       True,
