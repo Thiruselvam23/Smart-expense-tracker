@@ -1,5 +1,6 @@
 import os
 import uuid
+import logging
 import requests
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -17,6 +18,7 @@ from app.utils.security import create_access_token, create_refresh_token, hash_p
 from app.repositories.user_repo import UserRepository
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp'}
 
@@ -80,12 +82,15 @@ async def upload_profile_image(
     if len(contents) > 2 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Image must be under 2MB")
 
-    ext = os.path.splitext(file.filename)[1].lower() or '.jpg'
+    ext      = os.path.splitext(file.filename)[1].lower() or '.jpg'
+    filename = f"profile_{current_user['id']}{ext}"
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    filepath = os.path.join(settings.UPLOAD_DIR, filename)
 
-    # Use Cloudinary or local storage
-    from app.utils.file_utils import save_profile_image
-    image_url = await save_profile_image(contents, current_user['id'], ext)
+    with open(filepath, 'wb') as f:
+        f.write(contents)
 
+    image_url = f"/uploads/{filename}"
     await db.users.update_one(
         {"_id": ObjectId(current_user["id"])},
         {"$set": {"profile_image": image_url, "updated_at": datetime.utcnow()}},
@@ -107,7 +112,7 @@ async def google_login():
         "response_type": "code",
         "scope":         "openid email profile",
         "access_type":   "offline",
-        "prompt":        "select_account",   # always show account chooser
+        "prompt":        "select_account",
     }
     url = f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
     return RedirectResponse(url)
@@ -115,14 +120,16 @@ async def google_login():
 
 @router.get("/google/callback")
 async def google_callback(
-    code:  str = Query(...),
+    code: str = Query(...),
     db=Depends(get_db),
 ):
     """Step 2 — Google redirects back here with ?code=..."""
     if not settings.GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=503, detail="Google OAuth not configured")
 
-    # Exchange code for tokens
+    logger.info(f"Google callback received. Redirect URI being used: {settings.GOOGLE_REDIRECT_URI}")
+
+    # Exchange code for access token
     token_resp = requests.post(GOOGLE_TOKEN_URL, data={
         "code":          code,
         "client_id":     settings.GOOGLE_CLIENT_ID,
@@ -130,10 +137,18 @@ async def google_callback(
         "redirect_uri":  settings.GOOGLE_REDIRECT_URI,
         "grant_type":    "authorization_code",
     })
+
     if not token_resp.ok:
-        raise HTTPException(status_code=400, detail="Failed to exchange Google code")
+        error_detail = token_resp.json()
+        logger.error(f"Google token exchange failed: {error_detail}")
+        # Show exact Google error so we can debug
+        raise HTTPException(
+            status_code=400,
+            detail=f"Google auth failed: {error_detail.get('error_description', error_detail.get('error', 'Unknown'))}"
+        )
 
     google_access_token = token_resp.json().get("access_token")
+    logger.info("Google token exchange successful")
 
     # Fetch user info from Google
     user_resp = requests.get(
@@ -141,13 +156,16 @@ async def google_callback(
         headers={"Authorization": f"Bearer {google_access_token}"},
     )
     if not user_resp.ok:
+        logger.error(f"Google user info fetch failed: {user_resp.text}")
         raise HTTPException(status_code=400, detail="Failed to fetch Google user info")
 
-    guser = user_resp.json()
+    guser      = user_resp.json()
     email      = guser.get("email")
-    full_name  = guser.get("name", email.split("@")[0])
-    google_pic = guser.get("picture")  # Google profile picture URL
+    full_name  = guser.get("name", email.split("@")[0] if email else "User")
+    google_pic = guser.get("picture")
     google_id  = guser.get("id")
+
+    logger.info(f"Google user fetched: {email}")
 
     if not email:
         raise HTTPException(status_code=400, detail="Could not get email from Google")
@@ -165,17 +183,16 @@ async def google_callback(
         if not existing.get("profile_image") and google_pic:
             update["profile_image"] = google_pic
         await db.users.update_one({"_id": existing["_id"]}, {"$set": update})
-        # Re-fetch updated user
         existing = await repo.find_by_email(email)
         user_id  = str(existing["_id"])
         user_doc = existing
     else:
-        # Create new user (no password — Google-only account)
+        # Create new user
         now = datetime.utcnow()
         new_user = {
             "email":           email,
             "full_name":       full_name,
-            "hashed_password": hash_password(uuid.uuid4().hex),  # random unusable password
+            "hashed_password": hash_password(uuid.uuid4().hex),
             "google_id":       google_id,
             "profile_image":   google_pic,
             "is_active":       True,
@@ -184,10 +201,12 @@ async def google_callback(
             "created_at":      now,
             "updated_at":      now,
         }
-        result  = await db.users.insert_one(new_user)
-        user_id = str(result.inserted_id)
+        result   = await db.users.insert_one(new_user)
+        user_id  = str(result.inserted_id)
         user_doc = new_user
         user_doc["_id"] = result.inserted_id
+
+    logger.info(f"User ready: {user_id}")
 
     # Issue JWT tokens
     access_token  = create_access_token(user_id)
@@ -196,12 +215,12 @@ async def google_callback(
     expires_at = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     await repo.save_refresh_token(user_id, refresh_token, expires_at)
 
-    # Redirect to frontend with tokens in URL fragment
-    # Frontend reads these from the URL and stores them
+    # Redirect to frontend with tokens
     frontend_url = settings.FRONTEND_URL
     redirect_url = (
         f"{frontend_url}/auth/google/success"
         f"?access_token={access_token}"
         f"&refresh_token={refresh_token}"
     )
+    logger.info(f"Redirecting to frontend: {frontend_url}")
     return RedirectResponse(redirect_url)
