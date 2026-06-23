@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import RedirectResponse
 from bson import ObjectId
 
 from app.models.user import UserRegister, UserLogin, TokenResponse, RefreshRequest, AccessTokenResponse
@@ -15,7 +15,6 @@ from app.dependencies import get_current_user
 from app.database import get_db
 from app.config import settings
 from app.utils.security import create_access_token, create_refresh_token, hash_password
-from app.repositories.user_repo import UserRepository
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -125,36 +124,36 @@ async def google_callback(
     frontend_url = settings.FRONTEND_URL
 
     try:
-        logger.info(f"Google callback — using redirect_uri: {settings.GOOGLE_REDIRECT_URI}")
+        logger.info(f"Google callback — redirect_uri: {settings.GOOGLE_REDIRECT_URI}")
 
-        # ── Step 1: Exchange code for token ──────────────────────────────
+        # Step 1 — Exchange code for Google access token
         token_resp = requests.post(GOOGLE_TOKEN_URL, data={
             "code":          code,
             "client_id":     settings.GOOGLE_CLIENT_ID,
             "client_secret": settings.GOOGLE_CLIENT_SECRET,
             "redirect_uri":  settings.GOOGLE_REDIRECT_URI,
             "grant_type":    "authorization_code",
-        }, timeout=10)
+        }, timeout=15)
 
         if not token_resp.ok:
             err = token_resp.json()
             logger.error(f"Token exchange failed: {err}")
-            error_msg = err.get('error_description', err.get('error', 'Token exchange failed'))
-            return RedirectResponse(f"{frontend_url}/login?error={error_msg}")
+            msg = err.get('error_description', err.get('error', 'Google token exchange failed'))
+            return RedirectResponse(f"{frontend_url}/login?error={msg}")
 
         google_access_token = token_resp.json().get("access_token")
-        logger.info("Token exchange successful")
+        logger.info("Token exchange OK")
 
-        # ── Step 2: Get user info from Google ────────────────────────────
+        # Step 2 — Get Google user info
         user_resp = requests.get(
             GOOGLE_USER_URL,
             headers={"Authorization": f"Bearer {google_access_token}"},
-            timeout=10,
+            timeout=15,
         )
 
         if not user_resp.ok:
-            logger.error(f"User info fetch failed: {user_resp.text}")
-            return RedirectResponse(f"{frontend_url}/login?error=Failed to get user info from Google")
+            logger.error(f"User info failed: {user_resp.text}")
+            return RedirectResponse(f"{frontend_url}/login?error=Could not get user info from Google")
 
         guser      = user_resp.json()
         email      = guser.get("email", "").strip().lower()
@@ -165,9 +164,9 @@ async def google_callback(
         logger.info(f"Google user: {email}")
 
         if not email:
-            return RedirectResponse(f"{frontend_url}/login?error=No email from Google")
+            return RedirectResponse(f"{frontend_url}/login?error=No email returned from Google")
 
-        # ── Step 3: Find or create user ──────────────────────────────────
+        # Step 3 — Find or create user in MongoDB
         existing = await db.users.find_one({"email": email})
 
         if existing:
@@ -175,12 +174,15 @@ async def google_callback(
             update  = {"updated_at": datetime.utcnow()}
             if not existing.get("google_id"):
                 update["google_id"] = google_id
+            # Set Google profile picture only if user has no custom photo
             if not existing.get("profile_image") and google_pic:
                 update["profile_image"] = google_pic
             await db.users.update_one({"_id": existing["_id"]}, {"$set": update})
-            logger.info(f"Existing user logged in: {user_id}")
+            logger.info(f"Existing user: {user_id}")
         else:
-            now = datetime.utcnow()
+            # New user — create account
+            now    = datetime.utcnow()
+            # Use first 32 chars of uuid hex to stay within bcrypt 72-byte limit
             result = await db.users.insert_one({
                 "email":           email,
                 "full_name":       full_name,
@@ -196,13 +198,11 @@ async def google_callback(
             user_id = str(result.inserted_id)
             logger.info(f"New user created: {user_id}")
 
-        # ── Step 4: Issue JWT tokens ──────────────────────────────────────
+        # Step 4 — Issue JWT tokens
         access_token  = create_access_token(user_id)
         refresh_token = create_refresh_token(user_id)
+        expires_at    = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
-        expires_at = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-
-        # Save refresh token directly (avoid repo issues)
         await db.users.update_one(
             {"_id": ObjectId(user_id)},
             {"$set": {
@@ -210,17 +210,17 @@ async def google_callback(
                 "refresh_token_expires": expires_at,
             }}
         )
+        logger.info(f"Tokens issued for: {user_id}")
 
-        logger.info(f"Tokens issued for user: {user_id}")
-
-        # ── Step 5: Redirect to frontend ─────────────────────────────────
+        # Step 5 — Redirect to frontend callback page with tokens
         redirect_url = (
             f"{frontend_url}/auth/google/success"
             f"?access_token={access_token}"
             f"&refresh_token={refresh_token}"
         )
+        logger.info(f"Redirecting to: {frontend_url}/auth/google/success")
         return RedirectResponse(redirect_url)
 
     except Exception as e:
-        logger.error(f"Google callback unexpected error: {str(e)}", exc_info=True)
+        logger.error(f"Google callback error: {str(e)}", exc_info=True)
         return RedirectResponse(f"{frontend_url}/login?error=Login failed. Please try again.")

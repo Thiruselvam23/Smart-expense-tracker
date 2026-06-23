@@ -33,9 +33,13 @@ function PasswordField({ label, placeholder, error, showPass, onToggle, reg }) {
           className={`input-field pr-11 ${error ? 'border-red-400' : ''}`}
           {...reg}
         />
-        <button type="button" onClick={onToggle} tabIndex={-1}
+        <button
+          type="button"
+          onClick={onToggle}
+          tabIndex={-1}
           className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-70 transition-opacity"
-          style={{ color: 'var(--text-muted)' }}>
+          style={{ color: 'var(--text-muted)' }}
+        >
           {showPass ? <EyeOff size={18} /> : <Eye size={18} />}
         </button>
       </div>
@@ -115,27 +119,43 @@ export default function RegisterPage() {
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div>
             <label className="label">Full Name</label>
-            <input type="text" placeholder="Riya Sharma"
+            <input
+              type="text"
+              placeholder="Riya Sharma"
               className={`input-field ${errors.full_name ? 'border-red-400' : ''}`}
-              {...register('full_name')} />
+              {...register('full_name')}
+            />
             {errors.full_name && <p className="error-text">{errors.full_name.message}</p>}
           </div>
 
           <div>
             <label className="label">Email</label>
-            <input type="email" placeholder="you@example.com"
+            <input
+              type="email"
+              placeholder="you@example.com"
               className={`input-field ${errors.email ? 'border-red-400' : ''}`}
-              {...register('email')} />
+              {...register('email')}
+            />
             {errors.email && <p className="error-text">{errors.email.message}</p>}
           </div>
 
-          <PasswordField label="Password" placeholder="Min 8 chars + 1 number"
-            error={errors.password?.message} showPass={showPass}
-            onToggle={() => setShowPass(s => !s)} reg={register('password')} />
+          <PasswordField
+            label="Password"
+            placeholder="Min 8 chars + 1 number"
+            error={errors.password?.message}
+            showPass={showPass}
+            onToggle={() => setShowPass(s => !s)}
+            reg={register('password')}
+          />
 
-          <PasswordField label="Confirm Password" placeholder="Repeat your password"
-            error={errors.confirm?.message} showPass={showConfirm}
-            onToggle={() => setShowConfirm(s => !s)} reg={register('confirm')} />
+          <PasswordField
+            label="Confirm Password"
+            placeholder="Repeat your password"
+            error={errors.confirm?.message}
+            showPass={showConfirm}
+            onToggle={() => setShowConfirm(s => !s)}
+            reg={register('confirm')}
+          />
 
           <Button type="submit" loading={loading} className="w-full" size="lg">
             Create Account
@@ -144,7 +164,9 @@ export default function RegisterPage() {
 
         <p className="text-center text-sm mt-6" style={{ color: 'var(--text-muted)' }}>
           Already have an account?{' '}
-          <Link to="/login" className="text-[#2E86AB] font-medium hover:underline">Sign in</Link>
+          <Link to="/login" className="text-[#2E86AB] font-medium hover:underline">
+            Sign in
+          </Link>
         </p>
       </div>
     </div>
