@@ -1,29 +1,36 @@
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
 from app.config import settings
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def hash_password(password: str) -> str:
-    # bcrypt limit is 72 bytes — truncate to be safe
-    return pwd_context.hash(password[:72])
+    """Hash password using bcrypt directly — no passlib dependency."""
+    # Encode to bytes, truncate to 72 bytes (bcrypt hard limit)
+    pwd_bytes = password.encode('utf-8')[:72]
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain[:72], hashed)
+    """Verify password using bcrypt directly."""
+    try:
+        pwd_bytes    = plain.encode('utf-8')[:72]
+        hashed_bytes = hashed.encode('utf-8')
+        return bcrypt.checkpw(pwd_bytes, hashed_bytes)
+    except Exception:
+        return False
 
 
 def create_access_token(user_id: str) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire  = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {"sub": user_id, "exp": expire, "type": "access"}
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
 def create_refresh_token(user_id: str) -> str:
-    expire = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    expire  = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     payload = {"sub": user_id, "exp": expire, "type": "refresh"}
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
