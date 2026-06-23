@@ -6,10 +6,6 @@ const AuthContext = createContext(null)
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
-/**
- * Convert relative profile_image path → full URL.
- * e.g. "/uploads/profile_abc.jpg" → "http://localhost:8000/uploads/profile_abc.jpg"
- */
 const resolveUser = (user) => {
   if (!user) return null
   const img = user.profile_image
@@ -23,7 +19,6 @@ export function AuthProvider({ children }) {
   const [user, setUserRaw] = useState(null)
   const [loading, setLoading] = useState(true)
 
-  // Always resolve image URL before storing in state
   const setUser = (updater) => {
     setUserRaw(prev => {
       const next = typeof updater === 'function' ? updater(prev) : updater
@@ -34,21 +29,29 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     const tryRestore = async () => {
       const refreshToken = sessionStorage.getItem('refresh_token')
-      if (!refreshToken) { setLoading(false); return }
+      if (!refreshToken) {
+        setLoading(false)
+        return
+      }
+
       try {
-        // Step 1: get new access token using refresh token
+        // Get new access token
         const { data: tokenData } = await authAPI.refresh(refreshToken)
         setAccessToken(tokenData.access_token)
 
-        // Step 2: fetch FULL user profile (includes profile_image from DB)
+        // Get user profile
         const { data: meData } = await authAPI.me()
         setUser(meData)
-      } catch {
+      } catch (e) {
+        console.error('Session restore failed:', e.response?.data || e.message)
+        // Clear bad session
         sessionStorage.removeItem('refresh_token')
+        clearAccessToken()
       } finally {
         setLoading(false)
       }
     }
+
     tryRestore()
   }, [])
 
@@ -57,8 +60,6 @@ export function AuthProvider({ children }) {
     setAccessToken(data.access_token)
     sessionStorage.setItem('refresh_token', data.refresh_token)
 
-    // Login response already includes profile_image from backend
-    // But also call /me to get the absolute latest from DB
     try {
       const { data: meData } = await authAPI.me()
       setUser(meData)
