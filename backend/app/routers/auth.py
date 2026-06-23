@@ -14,7 +14,10 @@ from app.services.auth_service import AuthService
 from app.dependencies import get_current_user
 from app.database import get_db
 from app.config import settings
-from app.utils.security import create_access_token, create_refresh_token, hash_password
+from app.utils.security import (
+    create_access_token, create_refresh_token,
+    hash_password, verify_refresh_token,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -52,12 +55,38 @@ async def login(data: UserLogin, db=Depends(get_db)):
 
 @router.post("/refresh", response_model=AccessTokenResponse)
 async def refresh(data: RefreshRequest, db=Depends(get_db)):
-    return await AuthService(db).refresh_token(data.refresh_token)
+    """Works for both normal users and Google OAuth users."""
+    token   = data.refresh_token
+    payload = verify_refresh_token(token)
+
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    user_id = payload["sub"]
+
+    # Check token in DB — works for both auth flows
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    stored = user.get("refresh_token")
+    if stored != token:
+        raise HTTPException(status_code=401, detail="Refresh token revoked")
+
+    new_access = create_access_token(user_id)
+    return {
+        "access_token": new_access,
+        "token_type":   "bearer",
+        "expires_in":   settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
 
 
 @router.post("/logout")
 async def logout(current_user=Depends(get_current_user), db=Depends(get_db)):
-    await AuthService(db).logout(current_user["id"])
+    await db.users.update_one(
+        {"_id": ObjectId(current_user["id"])},
+        {"$unset": {"refresh_token": "", "refresh_token_expires": ""}},
+    )
     return {"message": "Logged out successfully"}
 
 
@@ -112,8 +141,7 @@ async def google_login():
         "access_type":   "offline",
         "prompt":        "select_account",
     }
-    url = f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
-    return RedirectResponse(url)
+    return RedirectResponse(f"{GOOGLE_AUTH_URL}?{urlencode(params)}")
 
 
 @router.get("/google/callback")
@@ -138,13 +166,13 @@ async def google_callback(
         if not token_resp.ok:
             err = token_resp.json()
             logger.error(f"Token exchange failed: {err}")
-            msg = err.get('error_description', err.get('error', 'Google token exchange failed'))
+            msg = err.get('error_description', err.get('error', 'Google auth failed'))
             return RedirectResponse(f"{frontend_url}/login?error={msg}")
 
         google_access_token = token_resp.json().get("access_token")
         logger.info("Token exchange OK")
 
-        # Step 2 — Get Google user info
+        # Step 2 — Get Google user profile
         user_resp = requests.get(
             GOOGLE_USER_URL,
             headers={"Authorization": f"Bearer {google_access_token}"},
@@ -153,20 +181,20 @@ async def google_callback(
 
         if not user_resp.ok:
             logger.error(f"User info failed: {user_resp.text}")
-            return RedirectResponse(f"{frontend_url}/login?error=Could not get user info from Google")
+            return RedirectResponse(f"{frontend_url}/login?error=Could not get Google profile")
 
         guser      = user_resp.json()
         email      = guser.get("email", "").strip().lower()
-        full_name  = guser.get("name") or email.split("@")[0]
+        full_name  = guser.get("name") or (email.split("@")[0] if email else "User")
         google_pic = guser.get("picture")
         google_id  = str(guser.get("id", ""))
 
         logger.info(f"Google user: {email}")
 
         if not email:
-            return RedirectResponse(f"{frontend_url}/login?error=No email returned from Google")
+            return RedirectResponse(f"{frontend_url}/login?error=No email from Google")
 
-        # Step 3 — Find or create user in MongoDB
+        # Step 3 — Find or create user
         existing = await db.users.find_one({"email": email})
 
         if existing:
@@ -174,15 +202,12 @@ async def google_callback(
             update  = {"updated_at": datetime.utcnow()}
             if not existing.get("google_id"):
                 update["google_id"] = google_id
-            # Set Google profile picture only if user has no custom photo
             if not existing.get("profile_image") and google_pic:
                 update["profile_image"] = google_pic
             await db.users.update_one({"_id": existing["_id"]}, {"$set": update})
             logger.info(f"Existing user: {user_id}")
         else:
-            # New user — create account
             now    = datetime.utcnow()
-            # Use first 32 chars of uuid hex to stay within bcrypt 72-byte limit
             result = await db.users.insert_one({
                 "email":           email,
                 "full_name":       full_name,
@@ -196,13 +221,14 @@ async def google_callback(
                 "updated_at":      now,
             })
             user_id = str(result.inserted_id)
-            logger.info(f"New user created: {user_id}")
+            logger.info(f"New user: {user_id}")
 
         # Step 4 — Issue JWT tokens
         access_token  = create_access_token(user_id)
         refresh_token = create_refresh_token(user_id)
         expires_at    = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
+        # Save refresh token — same field as normal login flow
         await db.users.update_one(
             {"_id": ObjectId(user_id)},
             {"$set": {
@@ -210,17 +236,18 @@ async def google_callback(
                 "refresh_token_expires": expires_at,
             }}
         )
-        logger.info(f"Tokens issued for: {user_id}")
+        logger.info(f"Tokens issued: {user_id}")
 
-        # Step 5 — Redirect to frontend callback page with tokens
+        # Step 5 — Redirect to frontend with tokens
         redirect_url = (
             f"{frontend_url}/auth/google/success"
             f"?access_token={access_token}"
             f"&refresh_token={refresh_token}"
         )
-        logger.info(f"Redirecting to: {frontend_url}/auth/google/success")
         return RedirectResponse(redirect_url)
 
     except Exception as e:
-        logger.error(f"Google callback error: {str(e)}", exc_info=True)
-        return RedirectResponse(f"{frontend_url}/login?error=Login failed. Please try again.")
+        logger.error(f"Google callback crashed: {str(e)}", exc_info=True)
+        return RedirectResponse(
+            f"{frontend_url}/login?error=Login+failed.+Please+try+again."
+        )
