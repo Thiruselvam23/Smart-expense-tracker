@@ -6,15 +6,12 @@ from app.config import settings
 
 
 def hash_password(password: str) -> str:
-    """Hash password using bcrypt directly — no passlib dependency."""
-    # Encode to bytes, truncate to 72 bytes (bcrypt hard limit)
     pwd_bytes = password.encode('utf-8')[:72]
     salt = bcrypt.gensalt(rounds=12)
     return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify password using bcrypt directly."""
     try:
         pwd_bytes    = plain.encode('utf-8')[:72]
         hashed_bytes = hashed.encode('utf-8')
