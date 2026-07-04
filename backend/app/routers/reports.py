@@ -1,94 +1,82 @@
-from fastapi import APIRouter, Depends, Query
-from fastapi.responses import Response
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from bson import ObjectId
 from datetime import datetime
-import calendar
-
+from app.services.ocr_service import process_receipt
+from app.utils.file_utils import validate_image_file, save_upload_file
 from app.dependencies import get_current_user
 from app.database import get_db
-from app.repositories.expense_repo import ExpenseRepository
-from app.services.analytics_service import AnalyticsService
-from app.utils.pdf_generator import generate_monthly_pdf
-from app.utils.excel_generator import generate_monthly_excel
+from app.config import settings
+import logging
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
-async def _get_report_data(user_id: str, month: int, year: int, db):
-    """Shared helper: fetch expenses + summary for a given month."""
-    expense_repo = ExpenseRepository(db)
-    analytics = AnalyticsService(db)
-
-    start = datetime(year, month, 1)
-    last_day = calendar.monthrange(year, month)[1]
-    end = datetime(year, month, last_day, 23, 59, 59)
-
-    # Fetch all expenses for the month (no pagination)
-    result = await expense_repo.find_paginated(
-        query={"user_id": __import__("bson").ObjectId(user_id), "date": {"$gte": start, "$lte": end}},
-        page=1,
-        limit=1000,
-        sort_field="date",
-        sort_order=1,
-    )
-    expenses = result["items"]
-
-    summary = await analytics.get_dashboard_summary(user_id)
-    return expenses, summary
-
-
-@router.get("/pdf")
-async def download_pdf(
-    month: int = Query(None, ge=1, le=12),
-    year: int = Query(None, ge=2000, le=2100),
+@router.post("/scan", status_code=202)
+async def scan_receipt(
+    file: UploadFile = File(...),
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-    now = datetime.utcnow()
-    month = month or now.month
-    year = year or now.year
+    # Check Vision API key is configured
+    if not settings.GOOGLE_VISION_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="OCR service not configured. Please add GOOGLE_VISION_API_KEY to environment variables."
+        )
 
-    expenses, summary = await _get_report_data(current_user["id"], month, year, db)
+    validate_image_file(file)
+    filepath = await save_upload_file(file)
 
-    pdf_bytes = generate_monthly_pdf(
-        user=current_user,
-        expenses=expenses,
-        summary=summary,
-        month=month,
-        year=year,
+    # Create job record
+    job = {
+        "user_id":    ObjectId(current_user["id"]),
+        "status":     "processing",
+        "image_path": filepath,
+        "created_at": datetime.utcnow(),
+    }
+    result = await db.ocr_jobs.insert_one(job)
+    job_id = str(result.inserted_id)
+
+    # Process with Google Vision
+    ocr_result = await process_receipt(filepath)
+
+    logger.info(f"OCR result for job {job_id}: success={ocr_result['success']} confidence={ocr_result['confidence']}")
+
+    status = "completed" if ocr_result["success"] else "failed"
+    await db.ocr_jobs.update_one(
+        {"_id": result.inserted_id},
+        {"$set": {
+            "status":        status,
+            "parsed":        ocr_result,
+            "raw_text":      ocr_result.get("raw_text", ""),
+            "error_message": ocr_result.get("error") if not ocr_result["success"] else None,
+        }},
     )
 
-    filename = f"expense_report_{calendar.month_abbr[month]}_{year}.pdf"
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    return {
+        "job_id": job_id,
+        "status": status,
+        "parsed": ocr_result,
+    }
 
 
-@router.get("/excel")
-async def download_excel(
-    month: int = Query(None, ge=1, le=12),
-    year: int = Query(None, ge=2000, le=2100),
+@router.get("/jobs/{job_id}")
+async def get_job_status(
+    job_id: str,
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-    now = datetime.utcnow()
-    month = month or now.month
-    year = year or now.year
-
-    expenses, summary = await _get_report_data(current_user["id"], month, year, db)
-
-    excel_bytes = generate_monthly_excel(
-        user=current_user,
-        expenses=expenses,
-        summary=summary,
-        month=month,
-        year=year,
+    job = await db.ocr_jobs.find_one(
+        {"_id": ObjectId(job_id), "user_id": ObjectId(current_user["id"])}
     )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
 
-    filename = f"expense_report_{calendar.month_abbr[month]}_{year}.xlsx"
-    return Response(
-        content=excel_bytes,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    return {
+        "job_id":        str(job["_id"]),
+        "status":        job["status"],
+        "parsed":        job.get("parsed"),
+        "error_message": job.get("error_message"),
+        "created_at":    job["created_at"],
+    }
