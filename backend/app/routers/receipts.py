@@ -18,10 +18,10 @@ async def scan_receipt(
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-    if not settings.GOOGLE_VISION_API_KEY:
+    if not settings.GEMINI_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="OCR service not configured. Please add GOOGLE_VISION_API_KEY."
+            detail="OCR service not configured. GEMINI_API_KEY missing."
         )
 
     validate_image_file(file)

@@ -27,14 +27,14 @@ def validate_image_file(file: UploadFile) -> None:
 
 
 async def save_upload_file(file: UploadFile) -> str:
-    """Save file locally — returns local filepath for OCR processing."""
+    """Save file locally for OCR processing. Returns local filepath."""
     contents = await file.read()
     size_mb  = len(contents) / (1024 * 1024)
 
     if size_mb > settings.MAX_FILE_SIZE_MB:
         raise HTTPException(
             status_code=413,
-            detail=f"File too large. Maximum size is {settings.MAX_FILE_SIZE_MB}MB.",
+            detail=f"File too large. Maximum {settings.MAX_FILE_SIZE_MB}MB allowed.",
         )
 
     ext      = os.path.splitext(file.filename)[1].lower() or '.jpg'
