@@ -32,8 +32,9 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str = ""
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/auth/google/callback"
 
-    # Google Vision API for OCR
+    # OCR APIs
     GOOGLE_VISION_API_KEY: str = ""
+    API4AI_KEY: str = ""           # Receipt OCR from api4.ai
 
     class Config:
         env_file = ".env"
