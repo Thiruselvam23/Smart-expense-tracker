@@ -1,4 +1,5 @@
 import re
+import base64
 import logging
 import os
 import requests
@@ -11,12 +12,12 @@ logger = logging.getLogger(__name__)
 def suggest_category(text: str) -> str:
     text = text.lower()
     rules = {
-        "Food":          ["restaurant","cafe","food","pizza","burger","biryani","hotel","bakery","dining","swiggy","zomato","chicken","prawn","veg","kitchen","eatery"],
-        "Travel":        ["uber","ola","fuel","petrol","cab","bus","metro","flight","railway","rapido"],
-        "Shopping":      ["amazon","flipkart","mall","store","mart","shop","supermarket","retail"],
-        "Entertainment": ["netflix","movie","cinema","pvr","inox","spotify"],
-        "Healthcare":    ["pharmacy","medical","hospital","clinic","doctor","lab","chemist"],
-        "Utilities":     ["electricity","water","gas","internet","jio","airtel","bill"],
+        "Food":          ["restaurant","cafe","food","pizza","burger","biryani","hotel","bakery","dining","swiggy","zomato","chicken","prawn","veg","kitchen","eatery","mess"],
+        "Travel":        ["uber","ola","fuel","petrol","cab","bus","metro","flight","railway","rapido","auto"],
+        "Shopping":      ["amazon","flipkart","mall","store","mart","shop","supermarket","retail","bazaar"],
+        "Entertainment": ["netflix","movie","cinema","pvr","inox","spotify","bookmyshow"],
+        "Healthcare":    ["pharmacy","medical","hospital","clinic","doctor","lab","chemist","diagnostic"],
+        "Utilities":     ["electricity","water","gas","internet","jio","airtel","bsnl","bill","recharge"],
         "Education":     ["book","course","college","school","tuition","stationery"],
     }
     for category, keywords in rules.items():
@@ -33,13 +34,14 @@ def parse_amount(val: str) -> Optional[float]:
         return None
 
 
-def extract_with_regex(text: str):
-    """Regex-based extraction for raw OCR text."""
+def extract_fields(text: str):
+    """Extract merchant, amount, date from raw OCR text using regex."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    # Merchant — first meaningful line
+    # Merchant — first meaningful line at top
     merchant = None
-    skip = {"receipt","invoice","bill","tax","gst","gstin","date","time","www","http","tel","ph","mobile","m:","cashier","dine"}
+    skip = {"receipt","invoice","bill","tax","gst","gstin","date","time","www","http",
+            "tel","ph","mobile","m:","cashier","dine","order","no","number","hsn"}
     for line in lines[:8]:
         if len(line) < 3 or len(line) > 60:
             continue
@@ -49,12 +51,13 @@ def extract_with_regex(text: str):
             merchant = line.title()
             break
 
-    # Amount — from bottom up
+    # Amount — search for grand total from bottom
     amount = None
     for pat in [
         r"grand\s*total[:\s₹]*\s*([\d,]+\.?\d*)",
         r"net\s*amount[:\s₹]*\s*([\d,]+\.?\d*)",
         r"total\s*amount[:\s₹]*\s*([\d,]+\.?\d*)",
+        r"amount\s*due[:\s₹]*\s*([\d,]+\.?\d*)",
         r"total[:\s₹]+\s*([\d,]+\.?\d*)",
         r"₹\s*([\d,]+\.\d{2})\b",
         r"\b(\d{3,6}\.\d{2})\b",
@@ -63,6 +66,7 @@ def extract_with_regex(text: str):
         if m:
             amount = parse_amount(m.group(1))
             if amount and amount > 0:
+                logger.info(f"Amount found with pattern '{pat}': {amount}")
                 break
 
     # Date
@@ -72,6 +76,7 @@ def extract_with_regex(text: str):
         r"\b(\d{4}[/\-]\d{2}[/\-]\d{2})\b",
         r"\b(\d{2}[/\-]\d{2}[/\-]\d{2})\b",
         r"\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{2,4})\b",
+        r"\b(\d{2}\.\d{2}\.\d{4})\b",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
@@ -81,108 +86,73 @@ def extract_with_regex(text: str):
     return merchant, amount, date_str
 
 
-async def call_api4ai(image_path: str) -> Optional[dict]:
-    """
-    Call API4AI Receipt OCR API.
-    Returns parsed receipt data directly.
-    Docs: https://api4.ai/docs/receipt-ocr
-    """
-    if not settings.API4AI_KEY:
-        logger.warning("API4AI_KEY not set")
+async def call_google_vision(image_path: str) -> Optional[str]:
+    """Call Google Cloud Vision API for text detection."""
+    if not settings.GOOGLE_VISION_API_KEY:
+        logger.warning("GOOGLE_VISION_API_KEY not set")
         return None
 
     try:
-        url = "https://ocr44.p.rapidapi.com/v1/results"
-
         with open(image_path, "rb") as f:
-            files = {"image": f}
-            headers = {
-                "X-RapidAPI-Key":  settings.API4AI_KEY,
-                "X-RapidAPI-Host": "ocr44.p.rapidapi.com",
-            }
-            resp = requests.post(url, files=files, headers=headers, timeout=30)
+            image_bytes = f.read()
 
-        logger.info(f"API4AI status: {resp.status_code}")
-        logger.info(f"API4AI response: {resp.text[:500]}")
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        payload = {
+            "requests": [{
+                "image": {"content": image_b64},
+                "features": [{"type": "TEXT_DETECTION", "maxResults": 1}],
+                "imageContext": {"languageHints": ["en"]}
+            }]
+        }
+
+        url = f"https://vision.googleapis.com/v1/images:annotate?key={settings.GOOGLE_VISION_API_KEY}"
+        resp = requests.post(url, json=payload, timeout=20)
+
+        logger.info(f"Vision API status: {resp.status_code}")
 
         if not resp.ok:
-            logger.error(f"API4AI error: {resp.text}")
+            logger.error(f"Vision API error: {resp.text[:300]}")
             return None
 
         data = resp.json()
+        annotations = data.get("responses", [{}])[0].get("textAnnotations", [])
 
-        # Extract from API4AI response structure
-        merchant = None
-        amount   = None
-        date_str = None
+        if not annotations:
+            logger.warning("Vision API returned no text annotations")
+            return None
 
-        # API4AI returns structured fields
-        results = data.get("results", [{}])
-        if results:
-            entities = results[0].get("entities", [])
-            for entity in entities:
-                name  = entity.get("name", "").lower()
-                value = entity.get("value", "")
-
-                if "merchant" in name or "store" in name or "company" in name:
-                    merchant = str(value).strip()
-
-                elif "total" in name and "sub" not in name:
-                    amount = parse_amount(str(value))
-
-                elif "date" in name:
-                    date_str = str(value).strip()
-
-            # Also try raw text if structured parsing missed fields
-            raw_text = results[0].get("text", "")
-            if raw_text:
-                m2, a2, d2 = extract_with_regex(raw_text)
-                if not merchant: merchant = m2
-                if not amount:   amount   = a2
-                if not date_str: date_str = d2
-
-            return {
-                "merchant": merchant,
-                "amount":   amount,
-                "date":     date_str,
-                "raw_text": raw_text[:2000],
-            }
+        full_text = annotations[0].get("description", "")
+        logger.info(f"Vision API extracted text:\n{full_text[:500]}")
+        return full_text
 
     except Exception as e:
-        logger.error(f"API4AI exception: {e}")
+        logger.error(f"Vision API exception: {e}")
         return None
 
 
-async def call_gemini_vision(image_path: str) -> Optional[dict]:
-    """Try Gemini with multiple methods."""
+async def call_gemini_vision(image_path: str) -> Optional[str]:
+    """Call Gemini Vision as fallback."""
     if not settings.GEMINI_API_KEY:
         return None
 
     try:
-        import base64
         with open(image_path, "rb") as f:
             image_bytes = f.read()
 
         ext = os.path.splitext(image_path)[1].lower().lstrip(".")
-        mime_map = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp","bmp":"image/bmp"}
+        mime_map = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp"}
         mime_type = mime_map.get(ext, "image/jpeg")
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        prompt = """Read this receipt image. Reply ONLY in this exact format (3 lines, nothing else):
-MERCHANT: <store name>
-AMOUNT: <grand total number only, e.g. 2683.00>
-DATE: <DD/MM/YYYY>
-Write UNKNOWN if not found."""
-
         payload = {
             "contents": [{"parts": [
-                {"text": prompt},
+                {"text": "Extract ALL text from this receipt image exactly as it appears. Return only the raw text, nothing else."},
                 {"inline_data": {"mime_type": mime_type, "data": image_b64}}
             ]}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 100}
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 500}
         }
 
-        # Try URL key method
         resp = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={settings.GEMINI_API_KEY}",
             json=payload, timeout=25
@@ -190,30 +160,9 @@ Write UNKNOWN if not found."""
         logger.info(f"Gemini status: {resp.status_code}")
 
         if resp.ok:
-            raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            logger.info(f"Gemini response: {repr(raw)}")
-
-            merchant, amount, date_str = None, None, None
-            for line in raw.split("\n"):
-                line = line.strip()
-                upper = line.upper()
-                if "MERCHANT:" in upper:
-                    val = line.split(":",1)[-1].strip()
-                    if val and "UNKNOWN" not in val.upper(): merchant = val
-                elif "AMOUNT:" in upper:
-                    val = line.split(":",1)[-1].strip()
-                    if val and "UNKNOWN" not in val.upper(): amount = parse_amount(val)
-                elif "DATE:" in upper:
-                    val = line.split(":",1)[-1].strip()
-                    if val and "UNKNOWN" not in val.upper(): date_str = val
-
-            # Regex fallback
-            m2, a2, d2 = extract_with_regex(raw)
-            if not merchant: merchant = m2
-            if not amount:   amount   = a2
-            if not date_str: date_str = d2
-
-            return {"merchant": merchant, "amount": amount, "date": date_str, "raw_text": raw}
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            logger.info(f"Gemini text: {text[:300]}")
+            return text
 
         logger.warning(f"Gemini failed: {resp.text[:200]}")
         return None
@@ -227,28 +176,22 @@ async def process_receipt(image_path: str) -> dict:
     try:
         logger.info(f"=== OCR START: {image_path} ===")
 
-        result = None
-        source = "none"
+        raw_text = None
+        source   = "none"
 
-        # Method 1: API4AI (best for receipts, dedicated OCR API)
-        if settings.API4AI_KEY:
-            logger.info("Trying API4AI...")
-            result = await call_api4ai(image_path)
-            if result:
-                source = "api4ai"
-                logger.info(f"API4AI success: {result}")
+        # Method 1: Google Cloud Vision (best accuracy)
+        raw_text = await call_google_vision(image_path)
+        if raw_text:
+            source = "google_vision"
 
-        # Method 2: Gemini Vision
-        if not result and settings.GEMINI_API_KEY:
-            logger.info("Trying Gemini Vision...")
-            result = await call_gemini_vision(image_path)
-            if result:
+        # Method 2: Gemini Vision fallback
+        if not raw_text:
+            raw_text = await call_gemini_vision(image_path)
+            if raw_text:
                 source = "gemini"
-                logger.info(f"Gemini success: {result}")
 
-        # Method 3: Tesseract (local fallback, no API needed)
-        if not result:
-            logger.info("Trying Tesseract fallback...")
+        # Method 3: Tesseract local fallback
+        if not raw_text:
             try:
                 import pytesseract
                 from PIL import Image
@@ -258,20 +201,19 @@ async def process_receipt(image_path: str) -> dict:
                 img = Image.open(io.BytesIO(img_bytes))
                 raw_text = pytesseract.image_to_string(img, lang='eng')
                 if raw_text.strip():
-                    merchant, amount, date_str = extract_with_regex(raw_text)
-                    result = {"merchant": merchant, "amount": amount, "date": date_str, "raw_text": raw_text}
                     source = "tesseract"
-                    logger.info(f"Tesseract success: merchant={merchant} amount={amount}")
+                    logger.info(f"Tesseract text: {raw_text[:200]}")
             except Exception as e:
                 logger.warning(f"Tesseract failed: {e}")
 
-        if not result:
-            return _error("All OCR methods failed. Please enter receipt details manually.")
+        if not raw_text or not raw_text.strip():
+            return _error("Could not extract text from image. Please enter details manually.")
 
-        merchant  = result.get("merchant")
-        amount    = result.get("amount")
-        date_str  = result.get("date")
-        raw_text  = result.get("raw_text", "")
+        logger.info(f"OCR source: {source}")
+        logger.info(f"Full text:\n{raw_text[:800]}")
+
+        # Extract fields using regex
+        merchant, amount, date_str = extract_fields(raw_text)
 
         confidence = round(
             (0.35 if merchant else 0.0) +
@@ -280,7 +222,7 @@ async def process_receipt(image_path: str) -> dict:
         )
         category = suggest_category(f"{merchant or ''} {raw_text}")
 
-        logger.info(f"=== OCR DONE (via {source}): merchant={merchant} amount={amount} date={date_str} conf={confidence} ===")
+        logger.info(f"=== OCR RESULT ({source}): merchant={merchant} amount={amount} date={date_str} conf={confidence} ===")
 
         return {
             "success":            True,
