@@ -35,13 +35,17 @@ def parse_amount(val: str) -> Optional[float]:
 
 
 def extract_fields(text: str):
-    """Extract merchant, amount, date from raw OCR text."""
+    """
+    Extract merchant, amount, date from raw OCR text.
+    Amount extraction prioritizes Grand Total over item prices.
+    """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    # Merchant — first meaningful line
+    # ── Merchant ─────────────────────────────────────────────────────────────
     merchant = None
     skip = {"receipt","invoice","bill","tax","gst","gstin","date","time","www","http",
-            "tel","ph","mobile","m:","cashier","dine","order","no","number","hsn","qty","price"}
+            "tel","ph","mobile","m:","cashier","dine","order","no","number","hsn",
+            "qty","price","amount","item","sub","total","round","thanks","thank"}
     for line in lines[:8]:
         if len(line) < 3 or len(line) > 60:
             continue
@@ -51,25 +55,68 @@ def extract_fields(text: str):
             merchant = line.title()
             break
 
-    # Amount — grand total from bottom
+    # ── Amount — strict priority order ───────────────────────────────────────
+    # Priority 1: "Grand Total" line (most specific — always the final bill)
     amount = None
-    for pat in [
-        r"grand\s*total[:\s₹]*\s*([\d,]+\.?\d*)",
-        r"net\s*amount[:\s₹]*\s*([\d,]+\.?\d*)",
-        r"total\s*amount[:\s₹]*\s*([\d,]+\.?\d*)",
-        r"amount\s*due[:\s₹]*\s*([\d,]+\.?\d*)",
-        r"total[:\s₹]+\s*([\d,]+\.?\d*)",
-        r"₹\s*([\d,]+\.\d{2})\b",
-        r"\b(\d{3,6}\.\d{2})\b",
-    ]:
+
+    # Search the ENTIRE text for grand total first
+    grand_total_patterns = [
+        r"grand\s*total\s*[₹:]*\s*([\d,]+\.?\d*)",
+        r"grand\s*total\s*[₹]\s*([\d,]+\.?\d*)",
+    ]
+    for pat in grand_total_patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             amount = parse_amount(m.group(1))
             if amount and amount > 0:
-                logger.info(f"Amount: {amount} via pattern '{pat}'")
+                logger.info(f"Grand Total found: {amount}")
                 break
 
-    # Date
+    # Priority 2: Net amount / total amount
+    if not amount:
+        for pat in [
+            r"net\s*amount[:\s₹]*\s*([\d,]+\.?\d*)",
+            r"total\s*amount[:\s₹]*\s*([\d,]+\.?\d*)",
+            r"amount\s*due[:\s₹]*\s*([\d,]+\.?\d*)",
+            r"payable[:\s₹]*\s*([\d,]+\.?\d*)",
+        ]:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                amount = parse_amount(m.group(1))
+                if amount and amount > 0:
+                    logger.info(f"Net/Total amount found: {amount} via '{pat}'")
+                    break
+
+    # Priority 3: Last "Total" line in the text
+    # (search from bottom up — last total is usually the grand total)
+    if not amount:
+        reversed_lines = list(reversed(lines))
+        for line in reversed_lines:
+            m = re.search(r'total[:\s₹]*\s*([\d,]+\.?\d*)', line, re.IGNORECASE)
+            if m:
+                # Make sure this is not a "Sub Total" or "Total Qty" line
+                line_lower = line.lower()
+                if 'sub' not in line_lower and 'qty' not in line_lower and 'item' not in line_lower:
+                    candidate = parse_amount(m.group(1))
+                    if candidate and candidate > 0:
+                        amount = candidate
+                        logger.info(f"Last Total line found: {amount} in '{line}'")
+                        break
+
+    # Priority 4: Largest ₹ amount in last 10 lines
+    # (receipts put the total at the bottom)
+    if not amount:
+        last_lines = "\n".join(lines[-10:])
+        candidates = []
+        for m in re.finditer(r'(?:₹\s*)?([\d,]+\.\d{2})\b', last_lines):
+            val = parse_amount(m.group(1))
+            if val and val > 0:
+                candidates.append(val)
+        if candidates:
+            amount = max(candidates)  # largest amount in bottom section
+            logger.info(f"Largest bottom amount: {amount}")
+
+    # ── Date ─────────────────────────────────────────────────────────────────
     date_str = None
     for pat in [
         r"\b(\d{2}[/\-]\d{2}[/\-]\d{4})\b",
@@ -82,64 +129,52 @@ def extract_fields(text: str):
             date_str = m.group(1)
             break
 
+    logger.info(f"Extracted: merchant={merchant} amount={amount} date={date_str}")
     return merchant, amount, date_str
 
 
 async def call_ocr_space(image_path: str) -> Optional[str]:
-    """
-    OCR.space free API — 25,000 requests/month, no credit card needed.
-    Get free key at: https://ocr.space/ocrapi/freekey
-    """
+    """OCR.space free API — 25,000 requests/month, no credit card."""
     api_key = getattr(settings, 'OCR_SPACE_KEY', '') or 'helloworld'
-    # 'helloworld' is OCR.space's public demo key (limited but works for testing)
 
     try:
         with open(image_path, "rb") as f:
             image_bytes = f.read()
 
-        # Convert to base64
         ext = os.path.splitext(image_path)[1].lower().lstrip(".")
-        mime_map = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp","bmp":"image/bmp"}
+        mime_map = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png",
+                    "webp":"image/webp","bmp":"image/bmp"}
         mime_type = mime_map.get(ext, "image/jpeg")
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        base64_image = f"data:{mime_type};base64,{image_b64}"
 
         payload = {
-            "apikey":           api_key,
-            "base64Image":      base64_image,
-            "language":         "eng",
+            "apikey":            api_key,
+            "base64Image":       f"data:{mime_type};base64,{image_b64}",
+            "language":          "eng",
             "isOverlayRequired": False,
             "detectOrientation": True,
-            "scale":            True,
-            "OCREngine":        2,  # Engine 2 is better for receipts
+            "scale":             True,
+            "OCREngine":         2,
         }
 
-        resp = requests.post(
-            "https://api.ocr.space/parse/image",
-            data=payload,
-            timeout=30
-        )
-
+        resp = requests.post("https://api.ocr.space/parse/image", data=payload, timeout=30)
         logger.info(f"OCR.space status: {resp.status_code}")
 
         if not resp.ok:
-            logger.error(f"OCR.space error: {resp.text[:200]}")
+            logger.error(f"OCR.space HTTP error: {resp.text[:200]}")
             return None
 
         data = resp.json()
-        logger.info(f"OCR.space response: {str(data)[:300]}")
-
         if data.get("IsErroredOnProcessing"):
-            logger.error(f"OCR.space processing error: {data.get('ErrorMessage')}")
+            logger.error(f"OCR.space error: {data.get('ErrorMessage')}")
             return None
 
         results = data.get("ParsedResults", [])
         if not results:
-            logger.warning("OCR.space returned no results")
             return None
 
         text = results[0].get("ParsedText", "")
-        logger.info(f"OCR.space extracted:\n{text[:500]}")
+        logger.info(f"OCR.space text:\n{text[:600]}")
         return text if text.strip() else None
 
     except Exception as e:
@@ -154,32 +189,26 @@ async def call_gemini_vision(image_path: str) -> Optional[str]:
     try:
         with open(image_path, "rb") as f:
             image_bytes = f.read()
-
         ext = os.path.splitext(image_path)[1].lower().lstrip(".")
         mime_map = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp"}
         mime_type = mime_map.get(ext, "image/jpeg")
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
         payload = {
             "contents": [{"parts": [
-                {"text": "Extract ALL text from this receipt image exactly as it appears. Return only the raw text."},
+                {"text": "Extract ALL text from this receipt exactly as it appears. Return only the raw text."},
                 {"inline_data": {"mime_type": mime_type, "data": image_b64}}
             ]}],
             "generationConfig": {"temperature": 0, "maxOutputTokens": 500}
         }
-
         resp = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={settings.GEMINI_API_KEY}",
             json=payload, timeout=25
         )
-        logger.info(f"Gemini status: {resp.status_code}")
-
         if resp.ok:
             text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
             logger.info(f"Gemini text: {text[:300]}")
             return text
-
-        logger.warning(f"Gemini failed: {resp.status_code} {resp.text[:100]}")
+        logger.warning(f"Gemini failed: {resp.status_code}")
         return None
     except Exception as e:
         logger.warning(f"Gemini exception: {e}")
@@ -193,24 +222,19 @@ async def process_receipt(image_path: str) -> dict:
         raw_text = None
         source   = "none"
 
-        # Method 1: OCR.space (free, no billing needed)
-        logger.info("Trying OCR.space...")
+        # Method 1: OCR.space (free)
         raw_text = await call_ocr_space(image_path)
         if raw_text:
             source = "ocr_space"
-            logger.info("OCR.space succeeded")
 
-        # Method 2: Gemini Vision fallback
+        # Method 2: Gemini fallback
         if not raw_text:
-            logger.info("Trying Gemini Vision...")
             raw_text = await call_gemini_vision(image_path)
             if raw_text:
                 source = "gemini"
-                logger.info("Gemini succeeded")
 
         # Method 3: Tesseract local fallback
         if not raw_text:
-            logger.info("Trying Tesseract...")
             try:
                 import pytesseract
                 from PIL import Image
@@ -221,16 +245,13 @@ async def process_receipt(image_path: str) -> dict:
                 raw_text = pytesseract.image_to_string(img, lang='eng')
                 if raw_text.strip():
                     source = "tesseract"
-                    logger.info(f"Tesseract succeeded: {raw_text[:100]}")
             except Exception as e:
                 logger.warning(f"Tesseract failed: {e}")
 
         if not raw_text or not raw_text.strip():
-            logger.error("All OCR methods failed")
             return _error("Could not read receipt. Please enter details manually.")
 
-        logger.info(f"OCR source: {source}")
-        logger.info(f"Full extracted text:\n{raw_text[:1000]}")
+        logger.info(f"Source: {source}\nFull text:\n{raw_text[:1000]}")
 
         merchant, amount, date_str = extract_fields(raw_text)
         confidence = round(
@@ -240,7 +261,7 @@ async def process_receipt(image_path: str) -> dict:
         )
         category = suggest_category(f"{merchant or ''} {raw_text}")
 
-        logger.info(f"=== RESULT ({source}): merchant={merchant} amount={amount} date={date_str} conf={confidence} ===")
+        logger.info(f"=== FINAL ({source}): merchant={merchant} amount={amount} date={date_str} conf={confidence} ===")
 
         return {
             "success":            True,
