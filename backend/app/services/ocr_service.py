@@ -16,8 +16,8 @@ def suggest_category(text: str) -> str:
         "Travel":        ["uber","ola","fuel","petrol","cab","bus","metro","flight","railway","rapido","auto"],
         "Shopping":      ["amazon","flipkart","mall","store","mart","shop","supermarket","retail","bazaar"],
         "Entertainment": ["netflix","movie","cinema","pvr","inox","spotify","bookmyshow"],
-        "Healthcare":    ["pharmacy","medical","hospital","clinic","doctor","lab","chemist","diagnostic"],
-        "Utilities":     ["electricity","water","gas","internet","jio","airtel","bsnl","bill","recharge"],
+        "Healthcare":    ["pharmacy","medical","hospital","clinic","doctor","lab","chemist"],
+        "Utilities":     ["electricity","water","gas","internet","jio","airtel","bill","recharge"],
         "Education":     ["book","course","college","school","tuition","stationery"],
     }
     for category, keywords in rules.items():
@@ -35,13 +35,13 @@ def parse_amount(val: str) -> Optional[float]:
 
 
 def extract_fields(text: str):
-    """Extract merchant, amount, date from raw OCR text using regex."""
+    """Extract merchant, amount, date from raw OCR text."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    # Merchant — first meaningful line at top
+    # Merchant — first meaningful line
     merchant = None
     skip = {"receipt","invoice","bill","tax","gst","gstin","date","time","www","http",
-            "tel","ph","mobile","m:","cashier","dine","order","no","number","hsn"}
+            "tel","ph","mobile","m:","cashier","dine","order","no","number","hsn","qty","price"}
     for line in lines[:8]:
         if len(line) < 3 or len(line) > 60:
             continue
@@ -51,7 +51,7 @@ def extract_fields(text: str):
             merchant = line.title()
             break
 
-    # Amount — search for grand total from bottom
+    # Amount — grand total from bottom
     amount = None
     for pat in [
         r"grand\s*total[:\s₹]*\s*([\d,]+\.?\d*)",
@@ -66,7 +66,7 @@ def extract_fields(text: str):
         if m:
             amount = parse_amount(m.group(1))
             if amount and amount > 0:
-                logger.info(f"Amount found with pattern '{pat}': {amount}")
+                logger.info(f"Amount: {amount} via pattern '{pat}'")
                 break
 
     # Date
@@ -76,7 +76,6 @@ def extract_fields(text: str):
         r"\b(\d{4}[/\-]\d{2}[/\-]\d{2})\b",
         r"\b(\d{2}[/\-]\d{2}[/\-]\d{2})\b",
         r"\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{2,4})\b",
-        r"\b(\d{2}\.\d{2}\.\d{4})\b",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
@@ -86,56 +85,72 @@ def extract_fields(text: str):
     return merchant, amount, date_str
 
 
-async def call_google_vision(image_path: str) -> Optional[str]:
-    """Call Google Cloud Vision API for text detection."""
-    if not settings.GOOGLE_VISION_API_KEY:
-        logger.warning("GOOGLE_VISION_API_KEY not set")
-        return None
+async def call_ocr_space(image_path: str) -> Optional[str]:
+    """
+    OCR.space free API — 25,000 requests/month, no credit card needed.
+    Get free key at: https://ocr.space/ocrapi/freekey
+    """
+    api_key = getattr(settings, 'OCR_SPACE_KEY', '') or 'helloworld'
+    # 'helloworld' is OCR.space's public demo key (limited but works for testing)
 
     try:
         with open(image_path, "rb") as f:
             image_bytes = f.read()
 
+        # Convert to base64
+        ext = os.path.splitext(image_path)[1].lower().lstrip(".")
+        mime_map = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp","bmp":"image/bmp"}
+        mime_type = mime_map.get(ext, "image/jpeg")
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        base64_image = f"data:{mime_type};base64,{image_b64}"
 
         payload = {
-            "requests": [{
-                "image": {"content": image_b64},
-                "features": [{"type": "TEXT_DETECTION", "maxResults": 1}],
-                "imageContext": {"languageHints": ["en"]}
-            }]
+            "apikey":           api_key,
+            "base64Image":      base64_image,
+            "language":         "eng",
+            "isOverlayRequired": False,
+            "detectOrientation": True,
+            "scale":            True,
+            "OCREngine":        2,  # Engine 2 is better for receipts
         }
 
-        url = f"https://vision.googleapis.com/v1/images:annotate?key={settings.GOOGLE_VISION_API_KEY}"
-        resp = requests.post(url, json=payload, timeout=20)
+        resp = requests.post(
+            "https://api.ocr.space/parse/image",
+            data=payload,
+            timeout=30
+        )
 
-        logger.info(f"Vision API status: {resp.status_code}")
+        logger.info(f"OCR.space status: {resp.status_code}")
 
         if not resp.ok:
-            logger.error(f"Vision API error: {resp.text[:300]}")
+            logger.error(f"OCR.space error: {resp.text[:200]}")
             return None
 
         data = resp.json()
-        annotations = data.get("responses", [{}])[0].get("textAnnotations", [])
+        logger.info(f"OCR.space response: {str(data)[:300]}")
 
-        if not annotations:
-            logger.warning("Vision API returned no text annotations")
+        if data.get("IsErroredOnProcessing"):
+            logger.error(f"OCR.space processing error: {data.get('ErrorMessage')}")
             return None
 
-        full_text = annotations[0].get("description", "")
-        logger.info(f"Vision API extracted text:\n{full_text[:500]}")
-        return full_text
+        results = data.get("ParsedResults", [])
+        if not results:
+            logger.warning("OCR.space returned no results")
+            return None
+
+        text = results[0].get("ParsedText", "")
+        logger.info(f"OCR.space extracted:\n{text[:500]}")
+        return text if text.strip() else None
 
     except Exception as e:
-        logger.error(f"Vision API exception: {e}")
+        logger.error(f"OCR.space exception: {e}")
         return None
 
 
 async def call_gemini_vision(image_path: str) -> Optional[str]:
-    """Call Gemini Vision as fallback."""
+    """Gemini Vision fallback."""
     if not settings.GEMINI_API_KEY:
         return None
-
     try:
         with open(image_path, "rb") as f:
             image_bytes = f.read()
@@ -147,7 +162,7 @@ async def call_gemini_vision(image_path: str) -> Optional[str]:
 
         payload = {
             "contents": [{"parts": [
-                {"text": "Extract ALL text from this receipt image exactly as it appears. Return only the raw text, nothing else."},
+                {"text": "Extract ALL text from this receipt image exactly as it appears. Return only the raw text."},
                 {"inline_data": {"mime_type": mime_type, "data": image_b64}}
             ]}],
             "generationConfig": {"temperature": 0, "maxOutputTokens": 500}
@@ -164,9 +179,8 @@ async def call_gemini_vision(image_path: str) -> Optional[str]:
             logger.info(f"Gemini text: {text[:300]}")
             return text
 
-        logger.warning(f"Gemini failed: {resp.text[:200]}")
+        logger.warning(f"Gemini failed: {resp.status_code} {resp.text[:100]}")
         return None
-
     except Exception as e:
         logger.warning(f"Gemini exception: {e}")
         return None
@@ -179,19 +193,24 @@ async def process_receipt(image_path: str) -> dict:
         raw_text = None
         source   = "none"
 
-        # Method 1: Google Cloud Vision (best accuracy)
-        raw_text = await call_google_vision(image_path)
+        # Method 1: OCR.space (free, no billing needed)
+        logger.info("Trying OCR.space...")
+        raw_text = await call_ocr_space(image_path)
         if raw_text:
-            source = "google_vision"
+            source = "ocr_space"
+            logger.info("OCR.space succeeded")
 
         # Method 2: Gemini Vision fallback
         if not raw_text:
+            logger.info("Trying Gemini Vision...")
             raw_text = await call_gemini_vision(image_path)
             if raw_text:
                 source = "gemini"
+                logger.info("Gemini succeeded")
 
         # Method 3: Tesseract local fallback
         if not raw_text:
+            logger.info("Trying Tesseract...")
             try:
                 import pytesseract
                 from PIL import Image
@@ -202,19 +221,18 @@ async def process_receipt(image_path: str) -> dict:
                 raw_text = pytesseract.image_to_string(img, lang='eng')
                 if raw_text.strip():
                     source = "tesseract"
-                    logger.info(f"Tesseract text: {raw_text[:200]}")
+                    logger.info(f"Tesseract succeeded: {raw_text[:100]}")
             except Exception as e:
                 logger.warning(f"Tesseract failed: {e}")
 
         if not raw_text or not raw_text.strip():
-            return _error("Could not extract text from image. Please enter details manually.")
+            logger.error("All OCR methods failed")
+            return _error("Could not read receipt. Please enter details manually.")
 
         logger.info(f"OCR source: {source}")
-        logger.info(f"Full text:\n{raw_text[:800]}")
+        logger.info(f"Full extracted text:\n{raw_text[:1000]}")
 
-        # Extract fields using regex
         merchant, amount, date_str = extract_fields(raw_text)
-
         confidence = round(
             (0.35 if merchant else 0.0) +
             (0.45 if amount   else 0.0) +
@@ -222,7 +240,7 @@ async def process_receipt(image_path: str) -> dict:
         )
         category = suggest_category(f"{merchant or ''} {raw_text}")
 
-        logger.info(f"=== OCR RESULT ({source}): merchant={merchant} amount={amount} date={date_str} conf={confidence} ===")
+        logger.info(f"=== RESULT ({source}): merchant={merchant} amount={amount} date={date_str} conf={confidence} ===")
 
         return {
             "success":            True,
