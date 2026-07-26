@@ -4,9 +4,10 @@ import { z } from 'zod'
 import { useAuth } from '../context/AuthContext'
 import { useNavigate, Link, useSearchParams } from 'react-router-dom'
 import { useState } from 'react'
-import { Eye, EyeOff } from 'lucide-react'
+import { Eye, EyeOff, Mail } from 'lucide-react'
 import Button from '../components/ui/Button'
 import toast from 'react-hot-toast'
+import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
@@ -20,22 +21,47 @@ export default function LoginPage() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const googleError = searchParams.get('error')
+
   const [loading, setLoading] = useState(false)
   const [showPass, setShowPass] = useState(false)
+  const [unverified, setUnverified] = useState(false)
+  const [unverifiedEmail, setUnverifiedEmail] = useState('')
+  const [resending, setResending] = useState(false)
 
-  const { register, handleSubmit, formState: { errors } } = useForm({
+  const { register, handleSubmit, formState: { errors }, getValues } = useForm({
     resolver: zodResolver(schema),
   })
 
   const onSubmit = async (data) => {
     setLoading(true)
+    setUnverified(false)
     try {
       await login(data.email, data.password)
       toast.success('Welcome back!')
       navigate('/dashboard')
     } catch (e) {
-      toast.error(e.response?.data?.detail || 'Login failed')
-    } finally { setLoading(false) }
+      const detail = e.response?.data?.detail || 'Login failed'
+
+      // Check if it's an unverified email error
+      if (detail.toLowerCase().includes('verify your email')) {
+        setUnverified(true)
+        setUnverifiedEmail(data.email)
+      } else {
+        toast.error(detail)
+      }
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleResend = async () => {
+    setResending(true)
+    try {
+      await axios.post(`${API_BASE}/api/auth/resend-verification?email=${encodeURIComponent(unverifiedEmail)}`)
+      toast.success('Verification email resent! Check your inbox.')
+    } catch {
+      toast.error('Failed to resend. Please try again.')
+    } finally { setResending(false) }
   }
 
   const handleGoogleLogin = () => {
@@ -56,24 +82,41 @@ export default function LoginPage() {
           </p>
         </div>
 
-        {/* Google error message */}
+        {/* Google OAuth error */}
         {googleError && (
           <div className="mb-4 text-red-600 text-sm text-center p-3 bg-red-50 rounded-lg border border-red-200">
             ⚠️ {decodeURIComponent(googleError)}
           </div>
         )}
 
-        {/* Google Sign-In Button */}
-        <button
-          onClick={handleGoogleLogin}
-          type="button"
+        {/* Unverified email warning */}
+        {unverified && (
+          <div className="mb-4 p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-xl">
+            <div className="flex items-start gap-3">
+              <Mail size={20} className="text-amber-600 flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold text-amber-700 dark:text-amber-400 text-sm">
+                  Email not verified
+                </p>
+                <p className="text-xs text-amber-600 dark:text-amber-300 mt-1">
+                  Please check your inbox at <strong>{unverifiedEmail}</strong> and click the verification link.
+                </p>
+                <button
+                  onClick={handleResend}
+                  disabled={resending}
+                  className="mt-2 text-xs font-medium text-amber-700 dark:text-amber-400 underline hover:no-underline disabled:opacity-50"
+                >
+                  {resending ? 'Sending...' : 'Resend verification email'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Google Sign-In */}
+        <button onClick={handleGoogleLogin} type="button"
           className="w-full flex items-center justify-center gap-3 px-4 py-3 rounded-xl border-2 font-medium text-sm transition-all hover:shadow-md active:scale-[0.98] mb-5"
-          style={{
-            borderColor: 'var(--border)',
-            background: 'var(--bg-card)',
-            color: 'var(--text-primary)',
-          }}
-        >
+          style={{ borderColor: 'var(--border)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}>
           <svg width="20" height="20" viewBox="0 0 48 48">
             <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
             <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
@@ -86,9 +129,7 @@ export default function LoginPage() {
         {/* Divider */}
         <div className="flex items-center gap-3 mb-5">
           <div className="flex-1 h-px" style={{ background: 'var(--border)' }} />
-          <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>
-            or sign in with email
-          </span>
+          <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>or sign in with email</span>
           <div className="flex-1 h-px" style={{ background: 'var(--border)' }} />
         </div>
 
@@ -96,31 +137,21 @@ export default function LoginPage() {
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div>
             <label className="label">Email</label>
-            <input
-              type="email"
-              placeholder="you@example.com"
+            <input type="email" placeholder="you@example.com"
               className={`input-field ${errors.email ? 'border-red-400' : ''}`}
-              {...register('email')}
-            />
+              {...register('email')} />
             {errors.email && <p className="error-text">{errors.email.message}</p>}
           </div>
 
           <div>
             <label className="label">Password</label>
             <div className="relative">
-              <input
-                type={showPass ? 'text' : 'password'}
-                placeholder="••••••••"
+              <input type={showPass ? 'text' : 'password'} placeholder="••••••••"
                 className={`input-field pr-11 ${errors.password ? 'border-red-400' : ''}`}
-                {...register('password')}
-              />
-              <button
-                type="button"
-                onClick={() => setShowPass(s => !s)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-70 transition-opacity"
-                style={{ color: 'var(--text-muted)' }}
-                tabIndex={-1}
-              >
+                {...register('password')} />
+              <button type="button" onClick={() => setShowPass(s => !s)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-70"
+                style={{ color: 'var(--text-muted)' }} tabIndex={-1}>
                 {showPass ? <EyeOff size={18} /> : <Eye size={18} />}
               </button>
             </div>

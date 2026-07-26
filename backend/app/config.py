@@ -33,10 +33,11 @@ class Settings(BaseSettings):
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/auth/google/callback"
 
     GOOGLE_VISION_API_KEY: str = ""
+    OCR_SPACE_KEY: str = "helloworld"
 
-    # OCR.space free API key
-    # Get free key at: https://ocr.space/ocrapi/freekey
-    OCR_SPACE_KEY: str = "helloworld"  # default demo key
+    # Email verification
+    RESEND_API_KEY: str = ""
+    FROM_EMAIL: str = "noreply@smartexpensetracker.com"
 
     class Config:
         env_file = ".env"

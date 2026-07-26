@@ -1,18 +1,18 @@
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { useAuth } from '../context/AuthContext'
 import { useNavigate, Link } from 'react-router-dom'
 import { useState } from 'react'
-import { Eye, EyeOff } from 'lucide-react'
+import { Eye, EyeOff, Mail, CheckCircle } from 'lucide-react'
 import Button from '../components/ui/Button'
 import toast from 'react-hot-toast'
+import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
 const schema = z.object({
   full_name: z.string().min(2, 'Name must be at least 2 characters'),
-  email: z.string().email('Invalid email'),
+  email: z.string().email('Invalid email address'),
   password: z.string()
     .min(8, 'Minimum 8 characters')
     .regex(/\d/, 'Must contain at least one number'),
@@ -27,19 +27,11 @@ function PasswordField({ label, placeholder, error, showPass, onToggle, reg }) {
     <div>
       <label className="label">{label}</label>
       <div className="relative">
-        <input
-          type={showPass ? 'text' : 'password'}
-          placeholder={placeholder}
-          className={`input-field pr-11 ${error ? 'border-red-400' : ''}`}
-          {...reg}
-        />
-        <button
-          type="button"
-          onClick={onToggle}
-          tabIndex={-1}
-          className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-70 transition-opacity"
-          style={{ color: 'var(--text-muted)' }}
-        >
+        <input type={showPass ? 'text' : 'password'} placeholder={placeholder}
+          className={`input-field pr-11 ${error ? 'border-red-400' : ''}`} {...reg} />
+        <button type="button" onClick={onToggle} tabIndex={-1}
+          className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-70"
+          style={{ color: 'var(--text-muted)' }}>
           {showPass ? <EyeOff size={18} /> : <Eye size={18} />}
         </button>
       </div>
@@ -49,11 +41,12 @@ function PasswordField({ label, placeholder, error, showPass, onToggle, reg }) {
 }
 
 export default function RegisterPage() {
-  const { register: registerUser } = useAuth()
   const navigate = useNavigate()
   const [loading, setLoading] = useState(false)
   const [showPass, setShowPass] = useState(false)
   const [showConfirm, setShowConfirm] = useState(false)
+  const [emailSent, setEmailSent] = useState(false)
+  const [sentTo, setSentTo] = useState('')
 
   const { register, handleSubmit, formState: { errors } } = useForm({
     resolver: zodResolver(schema),
@@ -62,18 +55,92 @@ export default function RegisterPage() {
   const onSubmit = async (data) => {
     setLoading(true)
     try {
-      await registerUser(data.full_name, data.email, data.password)
-      toast.success('Account created!')
-      navigate('/dashboard')
+      const resp = await axios.post(`${API_BASE}/api/auth/register`, {
+        full_name: data.full_name,
+        email: data.email,
+        password: data.password,
+      })
+
+      const result = resp.data
+
+      if (result.email_sent) {
+        // Show "check your email" screen
+        setEmailSent(true)
+        setSentTo(data.email)
+      } else {
+        // No email service — auto verified, store tokens and go to dashboard
+        const { useAuth } = await import('../context/AuthContext')
+        // Direct navigation since auto-verified
+        const { setAccessToken } = await import('../api/client')
+        setAccessToken(result.access_token)
+        sessionStorage.setItem('refresh_token', result.refresh_token)
+        toast.success('Account created!')
+        navigate('/dashboard')
+      }
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Registration failed')
-    } finally { setLoading(false) }
+    } finally {
+      setLoading(false)
+    }
   }
 
   const handleGoogleLogin = () => {
     window.location.href = `${API_BASE}/api/auth/google`
   }
 
+  const handleResend = async () => {
+    try {
+      await axios.post(`${API_BASE}/api/auth/resend-verification?email=${encodeURIComponent(sentTo)}`)
+      toast.success('Verification email resent!')
+    } catch {
+      toast.error('Failed to resend. Please try again.')
+    }
+  }
+
+  // ── Email sent screen ────────────────────────────────────────────────────
+  if (emailSent) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-[#1E3A5F] to-[#2E86AB] flex items-center justify-center p-4">
+        <div className="rounded-2xl shadow-2xl w-full max-w-md p-8 text-center"
+          style={{ background: 'var(--bg-card)' }}>
+          <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <Mail size={36} className="text-green-600" />
+          </div>
+          <h1 className="text-2xl font-bold text-[#1E3A5F] mb-2">Check Your Email</h1>
+          <p className="text-sm mb-2" style={{ color: 'var(--text-muted)' }}>
+            We sent a verification link to:
+          </p>
+          <p className="font-semibold text-[#1E3A5F] mb-6">{sentTo}</p>
+
+          <div className="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-4 mb-6 text-left space-y-2">
+            <div className="flex items-center gap-2 text-sm" style={{ color: 'var(--text-secondary)' }}>
+              <CheckCircle size={16} className="text-green-500 flex-shrink-0" />
+              Click the link in the email to verify your account
+            </div>
+            <div className="flex items-center gap-2 text-sm" style={{ color: 'var(--text-secondary)' }}>
+              <CheckCircle size={16} className="text-green-500 flex-shrink-0" />
+              Link expires in 24 hours
+            </div>
+            <div className="flex items-center gap-2 text-sm" style={{ color: 'var(--text-secondary)' }}>
+              <CheckCircle size={16} className="text-green-500 flex-shrink-0" />
+              Check spam/junk folder if not found
+            </div>
+          </div>
+
+          <button onClick={handleResend}
+            className="text-sm text-[#2E86AB] hover:underline mb-4 block w-full">
+            Didn't receive it? Resend verification email
+          </button>
+
+          <Link to="/login" className="text-sm" style={{ color: 'var(--text-muted)' }}>
+            ← Back to login
+          </Link>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Register form ─────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#1E3A5F] to-[#2E86AB] flex items-center justify-center p-4">
       <div className="rounded-2xl shadow-2xl w-full max-w-md p-8"
@@ -88,16 +155,9 @@ export default function RegisterPage() {
         </div>
 
         {/* Google Sign-Up */}
-        <button
-          onClick={handleGoogleLogin}
-          type="button"
+        <button onClick={handleGoogleLogin} type="button"
           className="w-full flex items-center justify-center gap-3 px-4 py-3 rounded-xl border-2 font-medium text-sm transition-all hover:shadow-md active:scale-[0.98] mb-5"
-          style={{
-            borderColor: 'var(--border)',
-            background: 'var(--bg-card)',
-            color: 'var(--text-primary)',
-          }}
-        >
+          style={{ borderColor: 'var(--border)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}>
           <svg width="20" height="20" viewBox="0 0 48 48">
             <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
             <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
@@ -107,56 +167,33 @@ export default function RegisterPage() {
           Continue with Google
         </button>
 
-        {/* Divider */}
         <div className="flex items-center gap-3 mb-5">
           <div className="flex-1 h-px" style={{ background: 'var(--border)' }} />
-          <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>
-            or register with email
-          </span>
+          <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>or register with email</span>
           <div className="flex-1 h-px" style={{ background: 'var(--border)' }} />
         </div>
 
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div>
             <label className="label">Full Name</label>
-            <input
-              type="text"
-              placeholder="Riya Sharma"
+            <input type="text" placeholder="Riya Sharma"
               className={`input-field ${errors.full_name ? 'border-red-400' : ''}`}
-              {...register('full_name')}
-            />
+              {...register('full_name')} />
             {errors.full_name && <p className="error-text">{errors.full_name.message}</p>}
           </div>
-
           <div>
             <label className="label">Email</label>
-            <input
-              type="email"
-              placeholder="you@example.com"
+            <input type="email" placeholder="you@example.com"
               className={`input-field ${errors.email ? 'border-red-400' : ''}`}
-              {...register('email')}
-            />
+              {...register('email')} />
             {errors.email && <p className="error-text">{errors.email.message}</p>}
           </div>
-
-          <PasswordField
-            label="Password"
-            placeholder="Min 8 chars + 1 number"
-            error={errors.password?.message}
-            showPass={showPass}
-            onToggle={() => setShowPass(s => !s)}
-            reg={register('password')}
-          />
-
-          <PasswordField
-            label="Confirm Password"
-            placeholder="Repeat your password"
-            error={errors.confirm?.message}
-            showPass={showConfirm}
-            onToggle={() => setShowConfirm(s => !s)}
-            reg={register('confirm')}
-          />
-
+          <PasswordField label="Password" placeholder="Min 8 chars + 1 number"
+            error={errors.password?.message} showPass={showPass}
+            onToggle={() => setShowPass(s => !s)} reg={register('password')} />
+          <PasswordField label="Confirm Password" placeholder="Repeat your password"
+            error={errors.confirm?.message} showPass={showConfirm}
+            onToggle={() => setShowConfirm(s => !s)} reg={register('confirm')} />
           <Button type="submit" loading={loading} className="w-full" size="lg">
             Create Account
           </Button>
@@ -164,9 +201,7 @@ export default function RegisterPage() {
 
         <p className="text-center text-sm mt-6" style={{ color: 'var(--text-muted)' }}>
           Already have an account?{' '}
-          <Link to="/login" className="text-[#2E86AB] font-medium hover:underline">
-            Sign in
-          </Link>
+          <Link to="/login" className="text-[#2E86AB] font-medium hover:underline">Sign in</Link>
         </p>
       </div>
     </div>
