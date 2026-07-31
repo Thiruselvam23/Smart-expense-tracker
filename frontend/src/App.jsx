@@ -3,7 +3,8 @@ import { useAuth } from './context/AuthContext'
 import AppLayout from './components/layout/AppLayout'
 import LoginPage from './pages/LoginPage'
 import RegisterPage from './pages/RegisterPage'
-import GoogleCallbackPage from './pages/Googlecallbackpage'
+import GoogleCallbackPage from './pages/GoogleCallbackPage'
+import VerifyEmailPage from './pages/VerifyEmailPage'
 import DashboardPage from './pages/DashboardPage'
 import ExpensesPage from './pages/ExpensesPage'
 import AddExpensePage from './pages/AddExpensePage'
@@ -20,7 +21,8 @@ import ThemeToggle from './components/ui/ThemeToggle'
 function PrivateRoute({ children }) {
   const { user, loading } = useAuth()
   if (loading) return (
-    <div className="flex items-center justify-center h-screen" style={{ background: 'var(--bg-base)' }}>
+    <div className="flex items-center justify-center h-screen"
+      style={{ background: 'var(--bg-base)' }}>
       <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-[#1E3A5F]" />
     </div>
   )
@@ -40,6 +42,9 @@ export default function App() {
         {/* Public routes */}
         <Route path="/login" element={<PublicRoute><LoginPage /></PublicRoute>} />
         <Route path="/register" element={<PublicRoute><RegisterPage /></PublicRoute>} />
+
+        {/* Email verification — always accessible */}
+        <Route path="/verify-email" element={<VerifyEmailPage />} />
 
         {/* Google OAuth callback — always accessible */}
         <Route path="/auth/google/success" element={<GoogleCallbackPage />} />

@@ -11,13 +11,12 @@ from fastapi.responses import RedirectResponse
 from bson import ObjectId
 
 from app.models.user import UserRegister, UserLogin, TokenResponse, RefreshRequest, AccessTokenResponse
-from app.services.auth_service import AuthService
 from app.dependencies import get_current_user
 from app.database import get_db
 from app.config import settings
 from app.utils.security import (
     create_access_token, create_refresh_token,
-    hash_password, verify_refresh_token,
+    hash_password, verify_password, verify_refresh_token,
 )
 from app.utils.email_utils import send_verification_email
 
@@ -33,13 +32,13 @@ GOOGLE_USER_URL  = "https://www.googleapis.com/oauth2/v2/userinfo"
 def format_user(user: dict, user_id: str = None) -> dict:
     uid = user_id or user.get("id") or str(user.get("_id", ""))
     return {
-        "id":              uid,
-        "email":           user.get("email"),
-        "full_name":       user.get("full_name"),
-        "created_at":      user.get("created_at"),
-        "preferences":     user.get("preferences", {}),
-        "profile_image":   user.get("profile_image"),
-        "is_verified":     user.get("is_verified", False),
+        "id":            uid,
+        "email":         user.get("email"),
+        "full_name":     user.get("full_name"),
+        "created_at":    user.get("created_at"),
+        "preferences":   user.get("preferences", {}),
+        "profile_image": user.get("profile_image"),
+        "is_verified":   user.get("is_verified", False),
     }
 
 
@@ -47,21 +46,19 @@ def format_user(user: dict, user_id: str = None) -> dict:
 
 @router.post("/register", status_code=201)
 async def register(data: UserRegister, db=Depends(get_db)):
-    # Check if email already exists
     existing = await db.users.find_one({"email": data.email})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    from app.utils.security import hash_password
     now   = datetime.utcnow()
-    token = secrets.token_urlsafe(32)  # email verification token
+    token = secrets.token_urlsafe(32)
 
     new_user = {
         "email":              data.email,
         "full_name":          data.full_name,
         "hashed_password":    hash_password(data.password),
         "is_active":          True,
-        "is_verified":        False,           # not verified yet
+        "is_verified":        False,
         "verification_token": token,
         "verification_sent":  now,
         "auth_provider":      "email",
@@ -78,13 +75,12 @@ async def register(data: UserRegister, db=Depends(get_db)):
 
     if email_sent:
         return {
-            "message": "Registration successful! Please check your email to verify your account.",
+            "message":    "Registration successful! Please check your email to verify your account.",
             "email_sent": True,
-            "email": data.email,
+            "email":      data.email,
         }
     else:
-        # If email fails (no RESEND key), auto-verify and return token
-        # This allows local dev to work without email setup
+        # No email service configured — auto verify for local dev
         await db.users.update_one(
             {"_id": result.inserted_id},
             {"$set": {"is_verified": True}}
@@ -115,19 +111,21 @@ async def verify_email(token: str = Query(...), db=Depends(get_db)):
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired verification link")
 
-    # Check token not older than 24 hours
     sent_at = user.get("verification_sent")
     if sent_at and (datetime.utcnow() - sent_at).total_seconds() > 86400:
-        raise HTTPException(status_code=400, detail="Verification link expired. Please register again.")
+        raise HTTPException(
+            status_code=400,
+            detail="Verification link expired. Please register again."
+        )
 
-    # Mark as verified
     await db.users.update_one(
         {"_id": user["_id"]},
-        {"$set": {"is_verified": True, "updated_at": datetime.utcnow()},
-         "$unset": {"verification_token": "", "verification_sent": ""}}
+        {
+            "$set":   {"is_verified": True, "updated_at": datetime.utcnow()},
+            "$unset": {"verification_token": "", "verification_sent": ""}
+        }
     )
 
-    # Issue tokens and redirect to frontend dashboard
     user_id       = str(user["_id"])
     access_token  = create_access_token(user_id)
     refresh_token = create_refresh_token(user_id)
@@ -138,19 +136,19 @@ async def verify_email(token: str = Query(...), db=Depends(get_db)):
         {"$set": {"refresh_token": refresh_token, "refresh_token_expires": expires_at}}
     )
 
-    # Redirect to frontend with tokens (same as Google OAuth flow)
-    redirect_url = (
-        f"{settings.FRONTEND_URL}/auth/google/success"
-        f"?access_token={access_token}"
-        f"&refresh_token={refresh_token}"
-    )
-    return RedirectResponse(redirect_url)
+    # Return JSON — VerifyEmailPage.jsx handles storing tokens and redirect
+    return {
+        "access_token":  access_token,
+        "refresh_token": refresh_token,
+        "token_type":    "bearer",
+        "message":       "Email verified successfully",
+    }
 
 
 # ── Resend Verification ───────────────────────────────────────────────────────
 
 @router.post("/resend-verification")
-async def resend_verification(email: str, db=Depends(get_db)):
+async def resend_verification(email: str = Query(...), db=Depends(get_db)):
     user = await db.users.find_one({"email": email})
     if not user:
         raise HTTPException(status_code=404, detail="Email not found")
@@ -170,7 +168,6 @@ async def resend_verification(email: str, db=Depends(get_db)):
 
 @router.post("/login", response_model=TokenResponse)
 async def login(data: UserLogin, db=Depends(get_db)):
-    from app.utils.security import verify_password
     user = await db.users.find_one({"email": data.email})
 
     if not user or not verify_password(data.password, user["hashed_password"]):
@@ -179,7 +176,7 @@ async def login(data: UserLogin, db=Depends(get_db)):
     if not user.get("is_active", True):
         raise HTTPException(status_code=403, detail="Account is deactivated")
 
-    # Block login if email not verified (only for email/password users)
+    # Block unverified email users
     if user.get("auth_provider", "email") == "email" and not user.get("is_verified", False):
         raise HTTPException(
             status_code=403,
@@ -216,9 +213,7 @@ async def refresh(data: RefreshRequest, db=Depends(get_db)):
 
     user_id = payload["sub"]
     user    = await db.users.find_one({"_id": ObjectId(user_id)})
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    if user.get("refresh_token") != token:
+    if not user or user.get("refresh_token") != token:
         raise HTTPException(status_code=401, detail="Refresh token revoked")
 
     return {
@@ -299,15 +294,18 @@ async def google_callback(code: str = Query(...), db=Depends(get_db)):
     frontend_url = settings.FRONTEND_URL
     try:
         token_resp = requests.post(GOOGLE_TOKEN_URL, data={
-            "code": code, "client_id": settings.GOOGLE_CLIENT_ID,
+            "code":          code,
+            "client_id":     settings.GOOGLE_CLIENT_ID,
             "client_secret": settings.GOOGLE_CLIENT_SECRET,
-            "redirect_uri": settings.GOOGLE_REDIRECT_URI,
-            "grant_type": "authorization_code",
+            "redirect_uri":  settings.GOOGLE_REDIRECT_URI,
+            "grant_type":    "authorization_code",
         }, timeout=15)
 
         if not token_resp.ok:
             err = token_resp.json()
-            return RedirectResponse(f"{frontend_url}/login?error={err.get('error_description','Auth failed')}")
+            return RedirectResponse(
+                f"{frontend_url}/login?error={err.get('error_description','Auth failed')}"
+            )
 
         google_access_token = token_resp.json().get("access_token")
         user_resp = requests.get(GOOGLE_USER_URL,
@@ -316,9 +314,9 @@ async def google_callback(code: str = Query(...), db=Depends(get_db)):
         if not user_resp.ok:
             return RedirectResponse(f"{frontend_url}/login?error=Could not get Google profile")
 
-        guser      = user_resp.json()
-        email      = guser.get("email", "").strip().lower()
-        full_name  = guser.get("name") or email.split("@")[0]
+        guser     = user_resp.json()
+        email     = guser.get("email", "").strip().lower()
+        full_name = guser.get("name") or email.split("@")[0]
         google_pic = guser.get("picture")
         google_id  = str(guser.get("id", ""))
 
@@ -328,10 +326,9 @@ async def google_callback(code: str = Query(...), db=Depends(get_db)):
         existing = await db.users.find_one({"email": email})
         if existing:
             user_id = str(existing["_id"])
-            update  = {"updated_at": datetime.utcnow()}
+            update  = {"updated_at": datetime.utcnow(), "is_verified": True}
             if not existing.get("google_id"):     update["google_id"]     = google_id
             if not existing.get("profile_image"): update["profile_image"] = google_pic
-            if not existing.get("is_verified"):   update["is_verified"]   = True
             await db.users.update_one({"_id": existing["_id"]}, {"$set": update})
         else:
             now    = datetime.utcnow()
